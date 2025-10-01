@@ -1,55 +1,86 @@
 e2e-local:
-  name: "E2E local (SUSE, Docker Engine, Testcontainers)"
-  runs-on: [self-hosted, linux]   # oder nur: linux
+  name: "E2E local (SUSE + Testcontainers ohne systemd)"
+  runs-on: [self-hosted, linux]
 
   env:
-    # Testcontainers soll NICHT versuchen, Images zu pullen (keine Internet-Calls)
+    # Keine Internet-Pulls – Images müssen vorab lokal vorhanden sein:
     TESTCONTAINERS_IMAGE_PULL_POLICY: never
     TESTCONTAINERS_CHECKS_DISABLE: "true"
-    DOCKER_HOST: unix:///var/run/docker.sock
 
   steps:
     - uses: actions/checkout@v4
 
-    - name: Install Docker & Tools (zypper)
+    - name: Tools installieren (zypper)
       run: |
         sudo zypper -n refresh
         sudo zypper -n install --no-recommends \
-          docker git maven java-17-openjdk-headless ca-certificates curl tar gzip which
-        sudo systemctl enable --now docker
-        docker info
+          docker podman podman-docker git maven java-17-openjdk-headless \
+          ca-certificates curl tar gzip which
+        update-ca-certificates || true
         java -version
         mvn -v
 
-    # Optional: vorab lokal bereitgestellte Images laden (kein Internet nötig)
-    # Lege die .tar-Dateien irgendwo intern ab oder als vorheriges Artefakt.
-    - name: Preload container images (no external pulls)
-      if: always()
+    - name: Container-Runtime bereitstellen (Docker-Socket oder Podman-API)
+      id: runtime
+      shell: bash
       run: |
-        # Beispiele – passe Pfade/Dateinamen an:
-        # docker load -i /opt/images/confluentinc_cp-kafka_7.5.2.tar
-        # docker load -i /opt/images/localstack_localstack_3.6.tar
-        # docker load -i /opt/images/gvenzl_oracle-xe_21-slim.tar
-        # Prüfen:
-        docker images
+        set -euo pipefail
+        if [ -S /var/run/docker.sock ] && docker info >/dev/null 2>&1; then
+          echo "→ Nutze Host-Docker-Socket"
+          echo "DOCKER_HOST=unix:///var/run/docker.sock" >> "$GITHUB_ENV"
+          echo "engine=docker" >> "$GITHUB_OUTPUT"
+        else
+          echo "→ Starte Podman-API-Socket ohne systemd"
+          SOCK="$HOME/podman.sock"
+          # Podman-Docker liefert 'docker' CLI, aber Testcontainers spricht die API
+          nohup podman system service --time=0 --log-level=error "unix://$SOCK" >/dev/null 2>&1 &
+          # Warten bis der Socket bereit ist
+          for i in {1..30}; do
+            if [ -S "$SOCK" ]; then break; fi; sleep 1;
+          done
+          test -S "$SOCK" || (echo "Podman-Socket nicht bereit" && exit 1)
+          echo "DOCKER_HOST=unix://$SOCK" >> "$GITHUB_ENV"
+          echo "engine=podman" >> "$GITHUB_OUTPUT"
+          podman info || true
+        fi
+
+    - name: (Optional) Lokale Images vorladen
+      # Lege eure .tar Files z. B. unter /opt/images ab oder als vorheriges Artefakt
+      # und passe IMAGES_DIR entsprechend an.
+      env:
+        IMAGES_DIR: /opt/images   # <-- an eure Umgebung anpassen oder Step entfernen
+      run: |
+        set -e
+        OCI=$(command -v docker || command -v podman)
+        if [ -d "$IMAGES_DIR" ]; then
+          shopt -s nullglob
+          for img in "$IMAGES_DIR"/*.tar; do
+            echo "Lade Image: $img"
+            $OCI load -i "$img"
+          done
+          $OCI images
+        else
+          echo "Kein IMAGES_DIR ($IMAGES_DIR) – überspringe preload."
+        fi
 
     - name: Build (package)
       run: mvn -B -ntp -DskipTests package
 
-    - name: Run tests (Testcontainers; nutzt lokalen Daemon)
+    - name: Tests (Testcontainers; nutzt DOCKER_HOST)
       run: mvn -B -ntp test
 
-    - name: Build & push image
+    - name: Build & Push Image
       id: build_and_push
       env:
-        REGISTRY: ${{ secrets.IMAGE_REGISTRY }}   # z. B. euer internes Harbor/GHCR
-        REPO:     ${{ secrets.IMAGE_REPO }}       # z. B. org/projekt
+        REGISTRY: ${{ secrets.IMAGE_REGISTRY }}     # interne Registry
+        REPO:     ${{ secrets.IMAGE_REPO }}         # z. B. org/projekt
         USERNAME: ${{ secrets.REGISTRY_USER }}
         PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
       run: |
         set -euo pipefail
+        OCI=$(command -v docker || command -v podman)
         IMAGE="${REGISTRY}/${REPO}:${GITHUB_SHA}"
-        echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
-        docker build -t "$IMAGE" .
-        docker push "$IMAGE"
+        echo "$PASSWORD" | $OCI login "$REGISTRY" -u "$USERNAME" --password-stdin
+        $OCI build -t "$IMAGE" .
+        $OCI push "$IMAGE"
         echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
