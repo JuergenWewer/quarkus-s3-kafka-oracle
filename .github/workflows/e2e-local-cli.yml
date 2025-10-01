@@ -1,37 +1,109 @@
-- name: Prepare rootless Podman (UID/GID range, socket)
+# ---- vor Build/Test einfügen ----
+- name: Install tools (zypper)
   shell: bash
   run: |
-    set -euo pipefail
-    # 1) SubUID/SubGID bereitstellen (großer Bereich)
+    set -euxo pipefail
+    sudo zypper -n refresh
+    sudo zypper -n install --no-recommends \
+      podman fuse-overlayfs slirp4netns \
+      git maven java-17-openjdk-headless ca-certificates curl tar gzip which
+    update-ca-certificates || true
+    java -version
+    mvn -v
+    podman --version
+
+- name: Configure subuid/subgid + migrate (rootless)
+  shell: bash
+  run: |
+    set -euxo pipefail
     USERNAME="$(whoami)"
-    if ! grep -q "^${USERNAME}:" /etc/subuid; then
+    echo "::group::subuid/subgid before"
+    (test -f /etc/subuid && cat /etc/subuid || true) | sed -n '1,100p'
+    (test -f /etc/subgid && cat /etc/subgid || true) | sed -n '1,100p'
+    echo "::endgroup::"
+
+    # Einträge idempotent anlegen (großer Bereich 1,048,576 IDs)
+    if ! grep -q "^${USERNAME}:" /etc/subuid 2>/dev/null; then
       echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subuid
     fi
-    if ! grep -q "^${USERNAME}:" /etc/subgid; then
+    if ! grep -q "^${USERNAME}:" /etc/subgid 2>/dev/null; then
       echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subgid
     fi
 
-    # 2) Tools für Rootless-Overlay & Netz
-    sudo zypper -n refresh
-    sudo zypper -n install --no-recommends fuse-overlayfs slirp4netns
+    echo "::group::subuid/subgid after"
+    cat /etc/subuid | sed -n '1,100p'
+    cat /etc/subgid | sed -n '1,100p'
+    echo "::endgroup::"
 
-    # 3) Podman-Konfiguration migrieren
-    podman system migrate
+    echo "::group::podman system migrate"
+    podman system migrate || true
+    echo "::endgroup::"
 
-    # 4) Docker-API-Socket (rootless) starten
-    SOCK="$HOME/podman.sock"
-    nohup podman system service --time=0 --log-level=error "unix://$SOCK" >/dev/null 2>&1 &
-    for i in {1..30}; do [ -S "$SOCK" ] && break || sleep 1; done
-    test -S "$SOCK"
-    echo "DOCKER_HOST=unix://$SOCK" >> "$GITHUB_ENV"
-
-    # 5) Optional: Rootless-Storage auf fuse-overlayfs fixieren
+    # Optional: Rootless-Storage auf fuse-overlayfs pinnen (sichtbar loggen)
     mkdir -p ~/.config/containers
     cat > ~/.config/containers/storage.conf <<'EOF'
     [storage]
     driver = "overlay"
     rootless_storage_path = "$HOME/.local/share/containers/storage"
-
     [storage.options]
     mount_program = "/usr/bin/fuse-overlayfs"
     EOF
+    echo "::group::storage.conf"
+    cat ~/.config/containers/storage.conf
+    echo "::endgroup::"
+
+    echo "::group::podman info (debug)"
+    podman info --debug || true
+    echo "::endgroup::"
+
+- name: Start Docker-API (rootless Podman) & export DOCKER_HOST
+  shell: bash
+  run: |
+    set -euxo pipefail
+    SOCK="$HOME/podman.sock"
+    # kill evtl. alten Service
+    pkill -f "podman system service" || true
+    nohup podman system service --time=0 --log-level=error "unix://$SOCK" >/dev/null 2>&1 &
+    for i in {1..30}; do [ -S "$SOCK" ] && break || sleep 1; done
+    test -S "$SOCK"
+    echo "DOCKER_HOST=unix://$SOCK" | tee -a "$GITHUB_ENV"
+    echo "DOCKER_HOST now: unix://$SOCK"   # <-- sichtbares Echo
+
+- name: Sanity checks (uid_map, env)
+  shell: bash
+  run: |
+    set -euxo pipefail
+    podman unshare cat /proc/self/uid_map
+    printenv | sort | sed -n '1,200p'
+
+# ---- optional: wenn Overlay Probleme macht, vfs als Fallback setzen ----
+- name: (Optional) Fallback: force VFS storage driver
+  if: ${{ env.FORCE_VFS == 'true' }}
+  shell: bash
+  run: |
+    echo "BUILDAH_STORAGE_DRIVER=vfs" | tee -a "$GITHUB_ENV"
+    echo "Using VFS storage driver as fallback."
+
+- name: Build (package)
+  run: mvn -B -ntp -DskipTests package
+
+- name: Run tests (Testcontainers → DOCKER_HOST)
+  env:
+    TESTCONTAINERS_IMAGE_PULL_POLICY: never   # keine externen Pulls
+    TESTCONTAINERS_CHECKS_DISABLE: "true"
+  run: mvn -B -ntp test
+
+- name: Build image (podman)
+  env:
+    IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+    IMAGE_REPO:     ${{ secrets.IMAGE_REPO }}
+  run: |
+    set -euxo pipefail
+    IMAGE="${IMAGE_REGISTRY}/${IMAGE_REPO}:${GITHUB_SHA}"
+    # Für VFS-Fallback:
+    if [ "${BUILDAH_STORAGE_DRIVER:-}" = "vfs" ]; then
+      podman build --storage-driver=vfs -t "$IMAGE" .
+    else
+      podman build -t "$IMAGE" .
+    fi
+    echo "Built $IMAGE"
