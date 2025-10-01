@@ -1,49 +1,37 @@
-e2e-local:
-  runs-on: [self-hosted, linux]
-  env:
-    TESTCONTAINERS_IMAGE_PULL_POLICY: never   # keine Internet-Pulls
-    TESTCONTAINERS_CHECKS_DISABLE: "true"
-  steps:
-    - uses: actions/checkout@v4
+- name: Prepare rootless Podman (UID/GID range, socket)
+  shell: bash
+  run: |
+    set -euo pipefail
+    # 1) SubUID/SubGID bereitstellen (großer Bereich)
+    USERNAME="$(whoami)"
+    if ! grep -q "^${USERNAME}:" /etc/subuid; then
+      echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subuid
+    fi
+    if ! grep -q "^${USERNAME}:" /etc/subgid; then
+      echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subgid
+    fi
 
-    - name: Install tools (zypper) – Podman statt Docker
-      run: |
-        sudo zypper -n refresh
-        sudo zypper -n install --no-recommends \
-          podman git maven java-17-openjdk-headless ca-certificates curl tar gzip which
-        update-ca-certificates || true
-        java -version; mvn -v; podman --version
+    # 2) Tools für Rootless-Overlay & Netz
+    sudo zypper -n refresh
+    sudo zypper -n install --no-recommends fuse-overlayfs slirp4netns
 
-    - name: Start Podman Docker-API (ohne systemd) & export DOCKER_HOST
-      run: |
-        set -e
-        SOCK="$HOME/podman.sock"
-        nohup podman system service --time=0 --log-level=error "unix://$SOCK" >/dev/null 2>&1 &
-        for i in {1..30}; do [ -S "$SOCK" ] && break || sleep 1; done
-        [ -S "$SOCK" ] || (echo "Podman socket not ready"; exit 1)
-        echo "DOCKER_HOST=unix://$SOCK" >> "$GITHUB_ENV"
+    # 3) Podman-Konfiguration migrieren
+    podman system migrate
 
-    - name: (Optional) Images lokal preloaden
-      run: |
-        # Beispiel: podman load -i /opt/images/confluentinc_cp-kafka_7.5.2.tar
-        podman images || true
+    # 4) Docker-API-Socket (rootless) starten
+    SOCK="$HOME/podman.sock"
+    nohup podman system service --time=0 --log-level=error "unix://$SOCK" >/dev/null 2>&1 &
+    for i in {1..30}; do [ -S "$SOCK" ] && break || sleep 1; done
+    test -S "$SOCK"
+    echo "DOCKER_HOST=unix://$SOCK" >> "$GITHUB_ENV"
 
-    - name: Build (package)
-      run: mvn -B -ntp -DskipTests package
+    # 5) Optional: Rootless-Storage auf fuse-overlayfs fixieren
+    mkdir -p ~/.config/containers
+    cat > ~/.config/containers/storage.conf <<'EOF'
+    [storage]
+    driver = "overlay"
+    rootless_storage_path = "$HOME/.local/share/containers/storage"
 
-    - name: Run tests (Testcontainers → Podman via DOCKER_HOST)
-      run: mvn -B -ntp test
-
-    - name: Build & push image (Podman)
-      env:
-        REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
-        REPO:     ${{ secrets.IMAGE_REPO }}
-        USERNAME: ${{ secrets.REGISTRY_USER }}
-        PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-      run: |
-        set -euo pipefail
-        IMAGE="${REGISTRY}/${REPO}:${GITHUB_SHA}"
-        echo "$PASSWORD" | podman login "$REGISTRY" -u "$USERNAME" --password-stdin
-        podman build -t "$IMAGE" .
-        podman push "$IMAGE"
-        echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+    [storage.options]
+    mount_program = "/usr/bin/fuse-overlayfs"
+    EOF
