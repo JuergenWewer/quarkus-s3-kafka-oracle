@@ -1,0 +1,55 @@
+e2e-local:
+  name: "E2E local (SUSE, Docker Engine, Testcontainers)"
+  runs-on: [self-hosted, linux]   # oder nur: linux
+
+  env:
+    # Testcontainers soll NICHT versuchen, Images zu pullen (keine Internet-Calls)
+    TESTCONTAINERS_IMAGE_PULL_POLICY: never
+    TESTCONTAINERS_CHECKS_DISABLE: "true"
+    DOCKER_HOST: unix:///var/run/docker.sock
+
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Docker & Tools (zypper)
+      run: |
+        sudo zypper -n refresh
+        sudo zypper -n install --no-recommends \
+          docker git maven java-17-openjdk-headless ca-certificates curl tar gzip which
+        sudo systemctl enable --now docker
+        docker info
+        java -version
+        mvn -v
+
+    # Optional: vorab lokal bereitgestellte Images laden (kein Internet nötig)
+    # Lege die .tar-Dateien irgendwo intern ab oder als vorheriges Artefakt.
+    - name: Preload container images (no external pulls)
+      if: always()
+      run: |
+        # Beispiele – passe Pfade/Dateinamen an:
+        # docker load -i /opt/images/confluentinc_cp-kafka_7.5.2.tar
+        # docker load -i /opt/images/localstack_localstack_3.6.tar
+        # docker load -i /opt/images/gvenzl_oracle-xe_21-slim.tar
+        # Prüfen:
+        docker images
+
+    - name: Build (package)
+      run: mvn -B -ntp -DskipTests package
+
+    - name: Run tests (Testcontainers; nutzt lokalen Daemon)
+      run: mvn -B -ntp test
+
+    - name: Build & push image
+      id: build_and_push
+      env:
+        REGISTRY: ${{ secrets.IMAGE_REGISTRY }}   # z. B. euer internes Harbor/GHCR
+        REPO:     ${{ secrets.IMAGE_REPO }}       # z. B. org/projekt
+        USERNAME: ${{ secrets.REGISTRY_USER }}
+        PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      run: |
+        set -euo pipefail
+        IMAGE="${REGISTRY}/${REPO}:${GITHUB_SHA}"
+        echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
+        docker build -t "$IMAGE" .
+        docker push "$IMAGE"
+        echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
