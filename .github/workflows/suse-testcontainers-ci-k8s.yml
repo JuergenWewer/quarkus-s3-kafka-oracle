@@ -1,0 +1,100 @@
+name: suse-testcontainers-ci-k8s
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  e2e-local:
+    runs-on: ubuntu-latest
+    container:
+      image: registry.opensuse.org/opensuse/leap:15.5
+      options: --user root
+    services:
+      docker:
+        image: docker:24-dind
+        env:
+          DOCKER_TLS_CERTDIR: ""
+        options: >-
+          --privileged
+          --host=tcp://0.0.0.0:2375
+          --host=unix:///var/run/docker.sock
+        ports:
+          - 2375:2375
+    env:
+      DOCKER_HOST: tcp://docker:2375
+      DOCKER_TLS_CERTDIR: ""
+      TESTCONTAINERS_CHECKS_DISABLE: "true"
+    outputs:
+      image: ${{ steps.build_and_push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install base tools
+        run: |
+          zypper -n refresh
+          zypper -n install git maven java-17-openjdk-headless ca-certificates curl tar gzip which
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2-
+      - name: Build
+        run: mvn -B -ntp -DskipTests package
+      - name: Test (Testcontainers)
+        run: mvn -B -ntp test
+      - name: Build & Push image
+        id: build_and_push
+        env:
+          REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+          REPO:     ${{ secrets.IMAGE_REPO }}
+          USERNAME: ${{ secrets.REGISTRY_USER }}
+          PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${REPO}:${GITHUB_SHA}"
+          echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  e2e-k8s:
+    needs: e2e-local
+    runs-on: ubuntu-latest
+    container:
+      image: registry.opensuse.org/opensuse/leap:15.5
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubectl & helm
+        run: |
+          zypper -n refresh
+          zypper -n install curl tar gzip ca-certificates
+          KUBECTL_VER="$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)"
+          curl -LO "https://storage.googleapis.com/kubernetes-release/release/${KUBECTL_VER}/bin/linux/amd64/kubectl"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          HELM_VER="v3.15.3"
+          curl -sSL "https://get.helm.sh/helm-${HELM_VER}-linux-amd64.tar.gz" | tar xz
+          install -m 0755 linux-amd64/helm /usr/local/bin/helm
+      - name: Setup kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          mkdir -p $HOME/.kube
+          echo "$KUBECONFIG_B64" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+      - name: Create namespace
+        run: kubectl create namespace test --dry-run=client -o yaml | kubectl apply -f -
+      - name: Kafka & MinIO
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm upgrade --install kafka bitnami/kafka --namespace test --set listeners.client.protocol=PLAINTEXT --set service.ports.client=9092 --set replicaCount=1
+          helm upgrade --install minio bitnami/minio --namespace test --set defaultBuckets=names-bucket --set auth.rootUser=minio --set auth.rootPassword=minio123 --set service.type=ClusterIP
+          kubectl -n test rollout status statefulset/kafka --timeout=10m || true
+          kubectl -n test rollout status deployment/minio --timeout=10m || true
+      - name: Oracle XE
+        run: |
+          kubectl -n test apply -f k8s/oracle-xe.yaml
+          kubectl -n test rollout status deployment/oracle-xe --timeout=10m
+      - name: Deploy app
+        env:
+          IMAGE: ${{ needs.e2e-local.outputs.image }}
+        run: |
+          sed "s#IMAGE_PLACEHOLDER#${IMAGE}#g" k8s/microservice-deployment.yaml | kubectl -n test apply -f -
+          kubectl -n test rollout status deployment/quarkus-app --timeout=10m

@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quarkus-app
+  namespace: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quarkus-app
+  template:
+    metadata:
+      labels:
+        app: quarkus-app
+    spec:
+      containers:
+        - name: app
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka.test.svc.cluster.local:9092"
+            - name: KAFKA_IN_TOPIC
+              value: "names-in"
+            - name: KAFKA_OUT_TOPIC
+              value: "names-out"
+            - name: S3_ENDPOINT
+              value: "http://minio.test.svc.cluster.local:9000"
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: root-user
+                  optional: true
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio
+                  key: root-password
+                  optional: true
+            - name: S3_BUCKET
+              value: "names-bucket"
+            - name: ORACLE_JDBC_URL
+              value: "jdbc:oracle:thin:@oracle-xe.test.svc.cluster.local:1521/XEPDB1"
+            - name: ORACLE_USERNAME
+              value: "system"
+            - name: ORACLE_PASSWORD
+              value: "oracle"
+          ports:
+            - containerPort: 8080

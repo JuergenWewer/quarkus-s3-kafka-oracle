@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oracle-xe
+  namespace: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oracle-xe
+  template:
+    metadata:
+      labels:
+        app: oracle-xe
+    spec:
+      containers:
+        - name: oracle-xe
+          image: gvenzl/oracle-xe:21-slim
+          env:
+            - name: ORACLE_PASSWORD
+              value: "oracle"
+          ports:
+            - containerPort: 1521
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oracle-xe
+  namespace: test
+spec:
+  selector:
+    app: oracle-xe
+  ports:
+    - name: tcp
+      port: 1521
+      targetPort: 1521
