@@ -1,45 +1,17 @@
-# ---- vor Build/Test einfügen ----
-- name: Install tools (zypper)
+- name: Prepare overlay (rootless)
   shell: bash
   run: |
     set -euxo pipefail
+    # 1) Pakete
     sudo zypper -n refresh
-    sudo zypper -n install --no-recommends \
-      podman fuse-overlayfs slirp4netns \
-      git maven java-17-openjdk-headless ca-certificates curl tar gzip which
-    update-ca-certificates || true
-    java -version
-    mvn -v
-    podman --version
+    sudo zypper -n install --no-recommends fuse-overlayfs slirp4netns
 
-- name: Configure subuid/subgid + migrate (rootless)
-  shell: bash
-  run: |
-    set -euxo pipefail
+    # 2) SubUID/SubGID (nur wenn noch nicht vorhanden)
     USERNAME="$(whoami)"
-    echo "::group::subuid/subgid before"
-    (test -f /etc/subuid && cat /etc/subuid || true) | sed -n '1,100p'
-    (test -f /etc/subgid && cat /etc/subgid || true) | sed -n '1,100p'
-    echo "::endgroup::"
+    grep -q "^${USERNAME}:" /etc/subuid  || echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subuid
+    grep -q "^${USERNAME}:" /etc/subgid  || echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subgid
 
-    # Einträge idempotent anlegen (großer Bereich 1,048,576 IDs)
-    if ! grep -q "^${USERNAME}:" /etc/subuid 2>/dev/null; then
-      echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subuid
-    fi
-    if ! grep -q "^${USERNAME}:" /etc/subgid 2>/dev/null; then
-      echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subgid
-    fi
-
-    echo "::group::subuid/subgid after"
-    cat /etc/subuid | sed -n '1,100p'
-    cat /etc/subgid | sed -n '1,100p'
-    echo "::endgroup::"
-
-    echo "::group::podman system migrate"
-    podman system migrate || true
-    echo "::endgroup::"
-
-    # Optional: Rootless-Storage auf fuse-overlayfs pinnen (sichtbar loggen)
+    # 3) storage.conf auf overlay setzen
     mkdir -p ~/.config/containers
     cat > ~/.config/containers/storage.conf <<'EOF'
     [storage]
@@ -48,62 +20,20 @@
     [storage.options]
     mount_program = "/usr/bin/fuse-overlayfs"
     EOF
-    echo "::group::storage.conf"
     cat ~/.config/containers/storage.conf
-    echo "::endgroup::"
 
-    echo "::group::podman info (debug)"
-    podman info --debug || true
-    echo "::endgroup::"
+    # 4) Store neu initialisieren
+    podman system reset -f || true
+    podman system migrate || true
 
-- name: Start Docker-API (rootless Podman) & export DOCKER_HOST
-  shell: bash
-  run: |
-    set -euxo pipefail
-    SOCK="$HOME/podman.sock"
-    # kill evtl. alten Service
+    # 5) Socket starten
     pkill -f "podman system service" || true
-    nohup podman system service --time=0 --log-level=error "unix://$SOCK" >/dev/null 2>&1 &
+    SOCK="$HOME/podman.sock"
+    nohup podman system service --time=0 "unix://$SOCK" >/dev/null 2>&1 &
     for i in {1..30}; do [ -S "$SOCK" ] && break || sleep 1; done
-    test -S "$SOCK"
     echo "DOCKER_HOST=unix://$SOCK" | tee -a "$GITHUB_ENV"
-    echo "DOCKER_HOST now: unix://$SOCK"   # <-- sichtbares Echo
+    echo ">> DOCKER_HOST now: unix://$SOCK"
 
-- name: Sanity checks (uid_map, env)
-  shell: bash
-  run: |
-    set -euxo pipefail
-    podman unshare cat /proc/self/uid_map
-    printenv | sort | sed -n '1,200p'
-
-# ---- optional: wenn Overlay Probleme macht, vfs als Fallback setzen ----
-- name: (Optional) Fallback: force VFS storage driver
-  if: ${{ env.FORCE_VFS == 'true' }}
-  shell: bash
-  run: |
-    echo "BUILDAH_STORAGE_DRIVER=vfs" | tee -a "$GITHUB_ENV"
-    echo "Using VFS storage driver as fallback."
-
-- name: Build (package)
-  run: mvn -B -ntp -DskipTests package
-
-- name: Run tests (Testcontainers → DOCKER_HOST)
-  env:
-    TESTCONTAINERS_IMAGE_PULL_POLICY: never   # keine externen Pulls
-    TESTCONTAINERS_CHECKS_DISABLE: "true"
-  run: mvn -B -ntp test
-
-- name: Build image (podman)
-  env:
-    IMAGE_REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
-    IMAGE_REPO:     ${{ secrets.IMAGE_REPO }}
-  run: |
-    set -euxo pipefail
-    IMAGE="${IMAGE_REGISTRY}/${IMAGE_REPO}:${GITHUB_SHA}"
-    # Für VFS-Fallback:
-    if [ "${BUILDAH_STORAGE_DRIVER:-}" = "vfs" ]; then
-      podman build --storage-driver=vfs -t "$IMAGE" .
-    else
-      podman build -t "$IMAGE" .
-    fi
-    echo "Built $IMAGE"
+    # 6) Verifizieren
+    echo ">> GraphDriverName:"
+    podman info --format '{{ .Store.GraphDriverName }}'  # sollte 'overlay' sein
