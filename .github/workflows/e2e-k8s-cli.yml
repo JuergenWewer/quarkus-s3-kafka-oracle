@@ -1,0 +1,65 @@
+e2e-k8s:
+  needs: e2e-local
+  runs-on: [self-hosted, linux]
+
+  env:
+    # Setze auf 'true', wenn ihr ein INTERNES Helm-Chart-Repo habt
+    WITH_HELM: 'false'
+
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Kubeconfig setzen
+      env:
+        KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+      run: |
+        mkdir -p "$HOME/.kube"
+        echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+        chmod 600 "$HOME/.kube/config"
+        kubectl version --client
+        kubectl cluster-info
+
+    - name: Namespace anlegen/aktualisieren
+      run: kubectl create namespace test --dry-run=client -o yaml | kubectl apply -f -
+
+    # Optionaler Block: nur verwenden, wenn ihr HELM intern spiegelt
+    - name: Kafka & MinIO via Helm (internes Repo)
+      if: env.WITH_HELM == 'true'
+      env:
+        HELM_REPO_URL: ${{ secrets.HELM_REPO_URL }}   # z.B. http(s)://helm.repo.intern/charts
+      run: |
+        helm version
+        helm repo add internal "$HELM_REPO_URL"
+        # Werte/Chart-Namen an euer internes Repo anpassen:
+        helm upgrade --install kafka internal/kafka \
+          --namespace test \
+          --set listeners.client.protocol=PLAINTEXT \
+          --set service.ports.client=9092 \
+          --set replicaCount=1
+        helm upgrade --install minio internal/minio \
+          --namespace test \
+          --set defaultBuckets=names-bucket \
+          --set auth.rootUser=minio \
+          --set auth.rootPassword=minio123 \
+          --set service.type=ClusterIP
+        kubectl -n test rollout status statefulset/kafka --timeout=10m || true
+        kubectl -n test rollout status deployment/minio --timeout=10m || true
+
+    # Falls ihr Helm nicht nutzen wollt: Oracle per Manifest aus dem Repo
+    - name: Oracle XE deployen (Manifest)
+      run: |
+        kubectl -n test apply -f k8s/oracle-xe.yaml
+        kubectl -n test rollout status deployment/oracle-xe --timeout=10m
+
+    - name: App deployen
+      env:
+        IMAGE: ${{ needs.e2e-local.outputs.image }}
+      run: |
+        sed "s#IMAGE_PLACEHOLDER#${IMAGE}#g" k8s/microservice-deployment.yaml | kubectl -n test apply -f -
+        kubectl -n test rollout status deployment/quarkus-app --timeout=10m
+
+    # Optional: einfache Readiness-Prüfungen
+    - name: Smoke-Checks
+      run: |
+        kubectl -n test get pods -o wide
+        kubectl -n test get svc
