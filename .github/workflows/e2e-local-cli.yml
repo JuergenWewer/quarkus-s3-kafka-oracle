@@ -1,17 +1,19 @@
+# 1) Nur einmal: Podman & Tools installieren
+- name: Install tools (zypper)
+  run: |
+    sudo zypper -n refresh
+    sudo zypper -n install --no-recommends \
+      podman fuse-overlayfs slirp4netns \
+      git maven java-17-openjdk-headless ca-certificates curl tar gzip which
+    java -version; mvn -v; podman --version
+
+# 2) Variante 2: Overlay sauber vorbereiten (ersetzt alle alten Podman-Prep/Start-Steps)
 - name: Prepare overlay (rootless)
-  shell: bash
   run: |
     set -euxo pipefail
-    # 1) Pakete
-    sudo zypper -n refresh
-    sudo zypper -n install --no-recommends fuse-overlayfs slirp4netns
-
-    # 2) SubUID/SubGID (nur wenn noch nicht vorhanden)
     USERNAME="$(whoami)"
-    grep -q "^${USERNAME}:" /etc/subuid  || echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subuid
-    grep -q "^${USERNAME}:" /etc/subgid  || echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subgid
-
-    # 3) storage.conf auf overlay setzen
+    grep -q "^${USERNAME}:" /etc/subuid || echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subuid
+    grep -q "^${USERNAME}:" /etc/subgid || echo "${USERNAME}:100000:1048576" | sudo tee -a /etc/subgid
     mkdir -p ~/.config/containers
     cat > ~/.config/containers/storage.conf <<'EOF'
     [storage]
@@ -20,20 +22,39 @@
     [storage.options]
     mount_program = "/usr/bin/fuse-overlayfs"
     EOF
-    cat ~/.config/containers/storage.conf
-
-    # 4) Store neu initialisieren
     podman system reset -f || true
     podman system migrate || true
-
-    # 5) Socket starten
     pkill -f "podman system service" || true
     SOCK="$HOME/podman.sock"
     nohup podman system service --time=0 "unix://$SOCK" >/dev/null 2>&1 &
     for i in {1..30}; do [ -S "$SOCK" ] && break || sleep 1; done
-    echo "DOCKER_HOST=unix://$SOCK" | tee -a "$GITHUB_ENV"
-    echo ">> DOCKER_HOST now: unix://$SOCK"
+    echo "DOCKER_HOST=unix://$SOCK" >> "$GITHUB_ENV"
+    # Kontrolle: sollte "overlay" ausgeben
+    podman info --format '{{ .Store.GraphDriverName }}'
 
-    # 6) Verifizieren
-    echo ">> GraphDriverName:"
-    podman info --format '{{ .Store.GraphDriverName }}'  # sollte 'overlay' sein
+# 3) (Optional) Testcontainers-Images lokal preloaden
+# podman load -i /opt/images/<deine-tarballs>.tar
+
+# 4) Build & Tests (Testcontainers nutzt DOCKER_HOST)
+- name: Build (package)
+  run: mvn -B -ntp -DskipTests package
+
+- name: Tests
+  env:
+    TESTCONTAINERS_IMAGE_PULL_POLICY: never
+    TESTCONTAINERS_CHECKS_DISABLE: "true"
+  run: mvn -B -ntp test
+
+# 5) Container bauen & pushen (Overlay aktiv)
+- name: Build & push image (Podman)
+  env:
+    REGISTRY: ${{ secrets.IMAGE_REGISTRY }}
+    REPO:     ${{ secrets.IMAGE_REPO }}
+    USERNAME: ${{ secrets.REGISTRY_USER }}
+    PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+  run: |
+    set -euxo pipefail
+    IMAGE="${REGISTRY}/${REPO}:${GITHUB_SHA}"
+    echo "$PASSWORD" | podman login "$REGISTRY" -u "$USERNAME" --password-stdin
+    podman build -t "$IMAGE" .
+    podman push "$IMAGE"
