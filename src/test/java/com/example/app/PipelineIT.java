@@ -1,6 +1,7 @@
 package com.example.app;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.common.QuarkusTestResource;
 import org.junit.jupiter.api.*;
 import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.containers.OracleContainer;
@@ -23,10 +24,11 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 @QuarkusTest
-@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@QuarkusTestResource(KafkaResource.class)
 public class PipelineIT {
 
     static KafkaContainer kafka = new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.5.2"));
@@ -109,3 +111,4 @@ public class PipelineIT {
         assertThat(listed.hasContents()).isTrue();
     }
 }
+
