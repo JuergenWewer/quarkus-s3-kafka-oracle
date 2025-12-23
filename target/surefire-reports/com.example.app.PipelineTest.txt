@@ -1,0 +1,4 @@
+-------------------------------------------------------------------------------
+Test set: com.example.app.PipelineTest
+-------------------------------------------------------------------------------
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 26.25 s -- in com.example.app.PipelineTest

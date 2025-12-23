@@ -12,8 +12,73 @@ Siehe `.github/workflows/suse-testcontainers-ci-k8s.yml` (DinD für Testcontaine
 - `IMAGE_REGISTRY`, `IMAGE_REPO`, `REGISTRY_USER`, `REGISTRY_PASSWORD`
 - `KUBECONFIG_B64`
 
-## Lokaler Start
+## Lokaler Start des Tests
 ```bash
-mvn -DskipTests package
-java -jar target/quarkus-app/quarkus-run.jar
+mvn clean install
 ```
+
+                           ┌────────────────────────────────────────────┐
+                           │        END-TO-END PIPELINE (Ablauf)        │
+                           └────────────────────────────────────────────┘
+
+┌──────────────┐        ┌────────────────────┐        ┌──────────────────────┐
+│   TESTCODE   │        │    KAFKA (in)      │        │      QUARKUS APP     │
+│  (JUnit)     │ -----> │  Topic: names-in   │ -----> │  consumes JSON       │
+└──────────────┘        └────────────────────┘        │  validates message   │ 
+                                                      │                      │
+                                                      │   ┌─────────────────────────────┐
+                                                      │   │  Save JSON to S3 (Localstack)│
+                                                      │   └─────────────────────────────┘
+                                                      │                      │
+                                                      │   ┌─────────────────────────────┐
+                                                      │   │ Insert name into Oracle XE  │
+                                                      │   │ SELECT MAX(id) to get new ID│
+                                                      │   └─────────────────────────────┘
+                                                      │                      │
+                                                      │   ┌─────────────────────────────┐
+                                                      │   │ Produce ID to Kafka (names-out)│
+                                                      │   └─────────────────────────────┘
+                                                      │
+                                                      └──────────────┬────────
+                                                                     │                                                      
+                                                                     ▼
+                                                      ┌────────────────────────────────────┐
+                                                      │      KAFKA (out)                   │
+                                                      │   Topic: names-out                 │
+                                                      └────────────────────────────────────┘
+                                                                     │
+                                                                     ▼
+                                                      ┌───────────────────────────┐
+                                                      │ TESTCODE liest ID zurück  │
+                                                      │ → Assertion erfolgreich   │
+                                                      └───────────────────────────┘
+
+
+            ┌─────────────────────────────────────────────────────────────────────────┐
+            │                 TESTCONTAINER-INFRASTRUKTUR (Übersicht)                 │
+            └─────────────────────────────────────────────────────────────────────────┘
+
+                        ┌─────────────────────────────────────────────────┐
+                        │                   TEST JVM                      │
+                        │  JUnit + QuarkusTest orchestrieren alles        │
+                        └─────────────────────────────────────────────────┘
+                                         │
+                ┌────────────────────────┼─────────────────────────┐
+                ▼                        ▼                         ▼
+      ┌────────────────┐       ┌────────────────┐        ┌─────────────────────┐
+      │   KAFKA        │       │  LOCALSTACK    │        │    ORACLE XE        │
+      │ Testcontainer  │       │ S3 Testcontainer│       │  Testcontainer      │
+      └────────────────┘       └────────────────┘        └─────────────────────┘
+                ▲                        ▲                         ▲
+                └───────────────┬────────┴───────────┬─────────────┘
+                                ▼                    ▼
+                           ┌─────────────────────────────────────────┐
+                           │         QUARKUS (System under Test)     │
+                           │   → konsumiert JSON                     │
+                           │   → schreibt S3                         │
+                           │   → schreibt Oracle DB                  │
+                           │   → sendet ID an Kafka                  │
+                           └─────────────────────────────────────────┘
+
+
+
